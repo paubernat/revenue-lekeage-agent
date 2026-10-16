@@ -85,6 +85,46 @@ run the plan
 
 ---
 
+### Prompt 6: Testing with the real model
+**Tool Used:** Claude Code
+**Prompt:**
+```
+i have the api key, can we test this? ... we should save like 5 at least
+run it 4 me
+okay list me a bunch of examples to test
+```
+**Result:** A token and cost meter in the sidebar, a 16-token key check before launching, the app started, and a categorised list of test prompts with the expected answers.
+**Follow-up:** `red when clicking ask about the plans is ugly as hell` led to a Streamlit theme with an indigo accent.
+
+---
+
+### Prompt 7: Questioning the agent's own answer
+**Tool Used:** Claude Code
+**Context:** The agent described the limits of its check; I wanted to know if that was true.
+**Prompt:**
+```
+[pasted the agent's "Limits of this check" answer] one question is this true? is this approach limited?
+okay, so now i feel like some of the edge cases might not be covered with the investigate tool,
+what could we do about it?
+with a + c what are we solving?
+```
+**Result:** Claude verified each claim against the code. Part was true (issue-date matching, the 12-month assumption) and part was invented (that orphans catch timing issues, that credits are ignored). It listed the uncovered cases, and explained a reconciliation safety net plus a "method" note so the agent stops guessing.
+
+---
+
+### Prompt 8: Edge-case hardening
+**Tool Used:** Claude Code (plan mode, then auto mode)
+**Prompt:**
+```
+propose a final approach where we cover as much edge cases as possible and prepare a set of tests in
+order to see if we solve each and every case. Also, explain to me simplifying it so i can catch it
+quick each case that we're currently handling, the ones that we expect to catch with the changes and
+a set of examples to test it. Generate documentation about it.
+```
+**Result:** 32 catalogued cases. 15 new rules, among them a missing FX rate, split and early billing, void and unpaid invoices, refunds, name and id variants, multi-year terms, rounding, unexplained credits, invalid records and duplicate ids. Also a per-plan reconciliation safety net, a `method` block, a demo dataset (`data_edge_cases/`) with a sidebar switch, and one test per case (42 tests). Claude also broke two rules on purpose to confirm the tests change. Documented in `EDGE_CASES.md`.
+
+---
+
 ## Reflection
 - Spending most of the time in plan mode, asking "for dummies" questions, paid off. I understood the
   domain traps (late billing, already-remediated FX) before any code existed, and the code mirrors

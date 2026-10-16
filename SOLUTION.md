@@ -12,7 +12,7 @@ after a human clicks Approve**.
 python -m venv .venv && .venv/Scripts/activate      # (source .venv/bin/activate on macOS/Linux)
 pip install -r requirements.txt
 cp .env.example .env                                 # add ANTHROPIC_API_KEY
-pytest -q                                            # 18 tests, no API key needed
+pytest -q                                            # 42 tests, no API key needed
 streamlit run app.py
 ```
 
@@ -20,19 +20,26 @@ streamlit run app.py
 
 ```
 app.py            Streamlit entry point: wires ui/ to the graph
-config.py         paths, model, as-of date (default 2025-12-31)
+config.py         paths, datasets, model, as-of date (default 2025-12-31), matching tolerances
 core/             pure business logic, no LLM and no UI, fully unit-tested
   models.py       pydantic records: Plan, Invoice, CreditMemo, Finding, Proposal, Action
-  repository.py   the only disk access: data/ (read-only) merged with sandbox/ (writable)
+  repository.py   the only disk access: data/ (read-only) merged with sandbox/ (writable);
+                  invalid records are skipped and reported, never fatal
   fx.py           conversion with the rate for the date or the closest earlier one
-  schedule.py     plan term + expected billing periods
-  detectors.py    expected vs. actual -> Findings (deterministic ids, calculation, evidence)
+  schedule.py     plan term + expected billing periods (end_date, rounding)
+  detectors.py    per plan: expected vs. actual -> Findings (deterministic ids, calculation, evidence)
+  checks.py       cross-plan: orphans, collection risk, unexplained credits, data quality, safety net
   actions.py      drafts with validation, apply, reject, rollback, audit log
+data_edge_cases/  demo dataset with one small plan per edge case (sidebar → Dataset)
 tools/            @tool wrappers over core/, the contract the LLM sees
 agent/            system prompt, LLM factory, LangGraph graph
 ui/               chat history + tool trace, approval card, sidebar (as-of, sandbox, audit log)
-tests/            detectors, actions, and the human-in-the-loop graph (scripted fake LLM)
+tests/            detectors, actions, edge cases (one test per case), and the
+                  human-in-the-loop graph (scripted fake LLM)
 ```
+
+**Edge cases:** see [EDGE_CASES.md](EDGE_CASES.md) for every case handled (32), plain-words explanations,
+a chat prompt to try each one, and the test that proves it.
 
 ### Graph
 
@@ -70,33 +77,42 @@ Every apply is re-validated, and every step is written to `sandbox/audit_log.jso
 
 ## Detection logic and assumptions
 
-1. **Term:** the plans have no end date, so a term is 12 months from `start_date`, ended the day before
-   an amendment (`amends`) starts. C-1007 therefore runs 2025-03-01..2025-06-30.
-2. **Expected periods:** cadence gives the number of periods (12/4/1), each worth `total_value / n`. A
-   period is *due* if it started on or before the **as-of date** (sidebar, default 2025-12-31). A
-   period cut short by an amendment is a *partial stub*, prorated by months, and treated as an
-   alternative reading rather than the primary one.
+1. **Term:** runs to `end_date` if the plan has one. The provided plans don't, so the term is 12 months
+   from `start_date`, ended the day before an amendment (`amends`) starts. C-1007 therefore runs
+   2025-03-01..2025-06-30.
+2. **Expected periods:** `total_value` is spread evenly over the contracted term by cadence; the last
+   period absorbs rounding. A period is *due* if it started on or before the **as-of date** (sidebar,
+   default 2025-12-31). A period cut short by an amendment is a *partial stub*, prorated by months, and
+   treated as an alternative reading rather than the primary one.
 3. **Matching:** each invoice belongs to the plan in effect on its issue date, following the amendment
-   chain. It goes into the period containing its issue date. If that slot is taken or is a stub while
-   an earlier due period is unbilled, it is treated as **late billing** of that earlier period (stated
-   as an assumption, medium confidence). This avoids reporting C-1007 as "missing Mar–May +
+   chain. It goes into the period containing its issue date. If that period is already billed, it moves
+   to the earliest unbilled earlier period (**late billing**), or to the next period if issued at most
+   10 days before it (**early billing**). Otherwise the invoices share the period and their amounts are
+   summed (split billing, refunds). A second invoice for the full amount is a duplicate. Moves are
+   stated as assumptions with medium confidence. This avoids reporting C-1007 as "missing Mar–May +
    overbilled June".
-4. **Comparison:** invoices are converted to the plan currency on their issue date. Each finding has a
-   signed `delta` = actual − expected (negative means underbilled).
-5. **Existing remediation:** credit memos (data and sandbox) and applied make-goods are netted
-   against findings, giving `remaining_delta` and `status = remediated | partially_remediated`.
-6. **Needs review:** orphan invoices (ranked candidate plans) and entitlement gaps, flagged only when the
-   plan notes ask for it. These are never acted on automatically.
+4. **Comparison:** invoices are converted to the plan currency on their issue date; void invoices are not
+   counted. Each finding has a signed `delta` = actual − expected (negative means underbilled).
+5. **Existing remediation:** credit memos (data and sandbox) and applied make-goods are netted against
+   findings, giving `remaining_delta` and `status = remediated | partially_remediated`. A credit memo that
+   no overbilling explains becomes `unmatched_credit`.
+6. **Needs review:** never acted on automatically. Covers orphan invoices (ranked candidate plans),
+   entitlement gaps, `collection_risk` (unpaid past due), `fx_rate_missing`, `data_quality` and
+   `unexplained_difference`.
+7. **Safety net:** per plan, `billed_to_date − expected_to_date` must equal the sum of the findings'
+   deltas. Any leftover becomes `unexplained_difference`, so no case can disappear silently.
 
 Finding types:
-- `missing_period`, `underbilled`, `overbilled`, `currency_mismatch` (each with a suggested action)
-- `duplicate_invoice`, `out_of_term`, `orphan_invoice`, `entitlement_gap`, `plan_inconsistency`
+- `missing_period`, `underbilled`, `overbilled`, `currency_mismatch`, `duplicate_invoice` (with a suggested action)
+- `out_of_term`, `orphan_invoice`, `entitlement_gap`, `plan_inconsistency`, `fx_rate_missing`,
+  `collection_risk`, `unmatched_credit`, `data_quality`, `unexplained_difference` (needs review)
 
 ### Findings on the provided data (as of 2025-12-31)
 
 | Plan | Finding | Delta | Notes |
 |---|---|---|---|
 | C-1001 ACME | Sep, Nov, Dec missing | −8,000 USD each | high confidence → make-good |
+| C-1001 ACME | I-9010 unpaid, due 2025-10-20 | — | `collection_risk`, 72 days overdue: a collections follow-up, not a billing fix |
 | C-1007 Globex | Mar–May billed 20,000 vs 22,500 (I-9110 late) | −2,500 USD | alt.: prorated June stub → −10,000 |
 | C-1007-A1 Globex | I-9123 25,000 EUR × 1.08 = 27,000 vs 25,000 | +2,000 USD | **already remediated by M-300** |
 | C-1007-A1 Globex | Q4 (Oct–Dec) missing | −25,000 USD | orphan I-9202 (15,000) may be a partial payment |
@@ -119,3 +135,6 @@ Finding types:
 - `MemorySaver` is in-memory: conversations are lost on restart. Swap in `SqliteSaver` for persistence.
 - The as-of date is a process-wide setting, which is fine for a single-user demo.
 - Free-text signals (entitlements, notes) use simple heuristics and are always marked low confidence.
+- Without a service period on invoices, a late invoice in a period nobody else billed can carry the wrong
+  month label (the amount is right). Pauses, usage-based billing and taxes are not modelled. See
+  [EDGE_CASES.md](EDGE_CASES.md#known-limitations-stated-in-the-method-block).

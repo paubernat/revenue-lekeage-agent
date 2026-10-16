@@ -45,9 +45,9 @@ def decide(decision: str) -> None:
     run(Command(resume=decision))
 
 
-render_sidebar(new_conversation)
-
 messages = graph.get_state(thread).values.get("messages", [])
+render_sidebar(new_conversation, messages)
+
 render_history(messages)
 if err := st.session_state.pop("error", None):
     st.error(err)

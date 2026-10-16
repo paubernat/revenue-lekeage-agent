@@ -19,6 +19,7 @@ class Plan(BaseModel):
     entitlements: list[str] = []
     notes: str = ""
     amends: Optional[str] = None
+    end_date: Optional[date] = None  # optional; without it the term is assumed to be 12 months
     amended_by_sandbox: list[str] = []  # AMD-xxx ids applied on top of the original
 
 
@@ -60,10 +61,11 @@ class Finding(BaseModel):
     type: Literal[
         "missing_period", "underbilled", "overbilled", "currency_mismatch",
         "duplicate_invoice", "out_of_term", "orphan_invoice", "entitlement_gap",
-        "plan_inconsistency",
+        "plan_inconsistency", "fx_rate_missing", "collection_risk", "unmatched_credit",
+        "data_quality", "unexplained_difference",
     ]
     plan_id: Optional[str]
-    customer_name: str
+    customer_name: str = ""
     invoice_ids: list[str] = []
     period: Optional[dict[str, str]] = None  # {"start": ..., "end": ...}
     expected: Optional[Money] = None

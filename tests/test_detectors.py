@@ -8,7 +8,7 @@ from core.fx import fx_convert
 def findings(plan_id="all", as_of=None):
     r = investigate(plan_id, as_of)
     return {f["finding_id"]: f for p in r["plans"] for f in p["findings"]} | {
-        f["finding_id"]: f for f in r["orphan_invoices"]}
+        f["finding_id"]: f for f in r["other_findings"]}
 
 
 def test_acme_missing_months():
@@ -22,7 +22,12 @@ def test_acme_missing_months():
 
 def test_as_of_limits_due_periods():
     f = findings("C-1001", as_of=date(2025, 10, 31))
-    assert list(f) == ["F-C-1001-missing_period-2025-09-01"]
+    assert [k for k, v in f.items() if v["type"] == "missing_period"] == ["F-C-1001-missing_period-2025-09-01"]
+
+
+def test_acme_unpaid_invoice_is_collection_risk():
+    risk = findings("C-1001")["F-C-1001-collection_risk-I-9010"]
+    assert risk["status"] == "needs_review" and "72 days overdue" in risk["calculation"]
 
 
 def test_globex_original_term_late_billing_not_false_positive():

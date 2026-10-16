@@ -7,13 +7,29 @@ import config
 from core import repository
 
 
-def render_sidebar(on_new_conversation: Callable[[], None]) -> None:
+def _usage(messages: list) -> tuple[int, int]:
+    tokens_in = sum((getattr(m, "usage_metadata", None) or {}).get("input_tokens", 0) for m in messages)
+    tokens_out = sum((getattr(m, "usage_metadata", None) or {}).get("output_tokens", 0) for m in messages)
+    return tokens_in, tokens_out
+
+
+def render_sidebar(on_new_conversation: Callable[[], None], messages: list) -> None:
     with st.sidebar:
         st.header("⚙️ Settings")
+        names = list(config.DATASETS)
+        current = next(n for n, path in config.DATASETS.items() if path == config.DATA_DIR)
+        dataset = st.selectbox("Dataset", names, index=names.index(current),
+                               help="'Edge cases' has one small plan per edge case (see EDGE_CASES.md)")
+        if dataset != current:
+            config.set_data_dir(dataset)  # each dataset has its own sandbox folder
+            on_new_conversation()
         as_of = st.date_input("Analysis as-of date", value=config.get_as_of(),
                               help="Only billing periods that started on or before this date count as due.")
         config.set_as_of(as_of)
         st.caption(f"Model: `{config.MODEL}`")
+        tokens_in, tokens_out = _usage(messages)
+        cost = tokens_in / 1e6 * config.PRICE_IN_PER_M + tokens_out / 1e6 * config.PRICE_OUT_PER_M
+        st.caption(f"This chat: {tokens_in:,} in / {tokens_out:,} out tokens ≈ ${cost:.3f}")
 
         col1, col2 = st.columns(2)
         if col1.button("New chat", use_container_width=True):

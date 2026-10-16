@@ -1,0 +1,3 @@
+[theme]
+# Replaces Streamlit's default red accent (focus ring, primary buttons)
+primaryColor = "#4F6BED"

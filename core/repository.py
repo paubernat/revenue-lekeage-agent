@@ -6,6 +6,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from pydantic import ValidationError
+
 import config
 from core.models import CreditMemo, Invoice, Plan
 
@@ -57,28 +59,64 @@ def audit(event: str, **details: Any) -> None:
 
 
 # ---------- domain reads ----------
+# Loading is tolerant: an invalid record or a repeated id is skipped and reported by
+# load_issues() (a data_quality finding) instead of crashing the whole analysis.
+
+def _build(raws: list[tuple[dict, str]], model, id_field: str, file: str) -> tuple[list, list[dict]]:
+    records, issues, seen = [], [], set()
+    for raw, source in raws:
+        rid = raw.get(id_field, "<no id>")
+        if rid in seen:
+            issues.append({"file": file, "record_id": rid, "problem": f"duplicate {id_field}; later copy ignored"})
+            continue
+        try:
+            records.append(model(**{**raw, **({"source": source} if "source" in model.model_fields else {})}))
+            seen.add(rid)
+        except ValidationError as e:
+            err = e.errors()[0]
+            field = ".".join(str(x) for x in err["loc"])
+            issues.append({"file": file, "record_id": rid, "problem": f"{field}: {err['msg']}; record ignored"})
+    return records, issues
+
+
+def _plans_and_issues() -> tuple[dict[str, Plan], list[dict]]:
+    raws = [dict(p) for p in _read(config.DATA_DIR / "billing_plans.json")]
+    for amd in read_sandbox("plan_amendments.json"):
+        for plan in raws:
+            if plan.get("plan_id") == amd["plan_id"]:
+                plan.update(amd["change_set"])
+                plan.setdefault("amended_by_sandbox", []).append(amd["amendment_id"])
+    plans, issues = _build([(p, "data") for p in raws], Plan, "plan_id", "billing_plans.json")
+    return {p.plan_id: p for p in plans}, issues
+
+
+def _invoices_and_issues() -> tuple[list[Invoice], list[dict]]:
+    raws = [(i, "data") for i in _read(config.DATA_DIR / "invoices.json")]
+    raws += [(i, "sandbox") for i in read_sandbox("invoices.json")]
+    return _build(raws, Invoice, "invoice_id", "invoices.json")
+
+
+def _memos_and_issues() -> tuple[list[CreditMemo], list[dict]]:
+    raws = [(m, "data") for m in _read(config.DATA_DIR / "credit_memos.json")]
+    raws += [(m, "sandbox") for m in read_sandbox("credit_memos.json")]
+    return _build(raws, CreditMemo, "memo_id", "credit_memos.json")
+
 
 def get_plans() -> dict[str, Plan]:
     """Original plans with sandbox amendments applied in order."""
-    plans = {p["plan_id"]: dict(p) for p in _read(config.DATA_DIR / "billing_plans.json")}
-    for amd in read_sandbox("plan_amendments.json"):
-        plan = plans.get(amd["plan_id"])
-        if plan is not None:
-            plan.update(amd["change_set"])
-            plan.setdefault("amended_by_sandbox", []).append(amd["amendment_id"])
-    return {pid: Plan(**p) for pid, p in plans.items()}
+    return _plans_and_issues()[0]
 
 
 def get_invoices() -> list[Invoice]:
-    data = [Invoice(**i) for i in _read(config.DATA_DIR / "invoices.json")]
-    sandbox = [Invoice(**{**i, "source": "sandbox"}) for i in read_sandbox("invoices.json")]
-    return data + sandbox
+    return _invoices_and_issues()[0]
 
 
 def get_credit_memos() -> list[CreditMemo]:
-    data = [CreditMemo(**m) for m in _read(config.DATA_DIR / "credit_memos.json")]
-    sandbox = [CreditMemo(**{**m, "source": "sandbox"}) for m in read_sandbox("credit_memos.json")]
-    return data + sandbox
+    return _memos_and_issues()[0]
+
+
+def load_issues() -> list[dict]:
+    return _plans_and_issues()[1] + _invoices_and_issues()[1] + _memos_and_issues()[1]
 
 
 def get_exchange_rates() -> list[dict]:
