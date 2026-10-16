@@ -1,2 +1,7 @@
 # Ignore prompts file
 prompts.md
+
+# Local secrets and caches
+.env
+__pycache__/
+.pytest_cache/

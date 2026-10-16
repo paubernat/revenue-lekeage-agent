@@ -1,0 +1,7 @@
+langgraph>=0.4
+langchain-core>=0.3
+langchain-anthropic>=0.3
+streamlit>=1.40
+pydantic>=2.7
+python-dotenv>=1.0
+pytest>=8.0
