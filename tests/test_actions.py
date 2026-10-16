@@ -3,7 +3,7 @@ import pytest
 
 from core import actions, repository
 from core.actions import ActionError
-from core.detectors import find_finding
+from core.investigation import find_finding
 
 SEPT = "F-C-1001-missing_period-2025-09-01"
 

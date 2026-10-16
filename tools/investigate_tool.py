@@ -1,6 +1,6 @@
 from langchain_core.tools import tool
 
-from core.detectors import investigate as _investigate
+from core.investigation import investigate as _investigate
 
 
 @tool

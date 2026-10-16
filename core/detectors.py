@@ -1,235 +1,102 @@
-"""Compare expected billing (schedule.py) with actual invoices and produce Findings.
+"""Per-plan analysis: what should have been billed vs. what was billed.
 
-Deterministic: same data + same as_of => same findings with the same ids. Ambiguity is
-never hidden. It goes into `assumptions`, `confidence` and `alternatives` so the agent
-can ask the human. Cross-plan checks (orphans, credits, data quality, safety net) live in checks.py.
+analyze_plan() runs five steps for ONE plan:
+
+    expected periods (schedule.py) ─┐
+                                    ├─ 1. ASSIGN  each invoice to the period it pays for
+    the plan's invoices ────────────┘            (normal / late / early / shared)
+                                       2. JUDGE   each period: missing, under/overbilled,
+                                                  currency mismatch, duplicate
+                                       3. STUB    if a newer plan cut this one short, offer the
+                                                  leftover stub as an alternative reading
+                                       4. HINTS   free-text signals: entitlements, notes
+                                       5. RECONCILE  safety net: findings must explain the whole gap
+
+Deterministic: same data + same as-of date => same findings, with the same ids.
+Ambiguity is never hidden. It goes into `assumptions`, `confidence` and `alternatives`.
 """
 import re
-from collections import defaultdict
+from dataclasses import dataclass, field
 from datetime import date
 
 import config
-from core import checks, repository
+from core import checks
 from core.fx import FxError, fx_convert
-from core.models import PERIODS_PER_YEAR, CreditMemo, Finding, Invoice, Money, Plan
-from core.schedule import effective_plan_id, expected_periods, per_period_amount, term
+from core.models import EPS, Finding, Invoice, Money, Plan
+from core.schedule import expected_periods, per_period_amount, term
 
-EPS = 0.01
 VOID_STATUSES = {"void", "voided", "cancelled", "canceled"}
 
-# Returned with every investigation so the agent explains its method from facts, not guesses.
-METHOD = {
-    "term": "Runs to end_date if the plan has one, else 12 months from start_date; ends the day before an "
-            "amending plan (amends) starts. The cut-off stub is offered as an alternative, not as a gap.",
-    "expected": "total_value spread evenly over the contracted term by cadence; last period absorbs rounding. "
-                "A period is due if it started on or before the as-of date.",
-    "matching": "Invoices are matched to plans by plan_id, following the amendment chain by issue date. Each "
-                "invoice goes to the period containing its issue_date. If that period is already billed: to the "
-                f"earliest unbilled earlier period (late billing), or to the next period if issued at most "
-                f"{config.EARLY_BILLING_DAYS} days before it (early billing). Only invoices worth at least "
-                f"{config.REASSIGN_MIN_SHARE:.0%} of the period are moved. Otherwise they share the period: "
-                "amounts are summed (split billing, refunds); a second full-amount invoice is a duplicate.",
-    "currency": "Converted to the plan currency with the rate on the issue date or the closest earlier one. "
-                "No rate -> fx_rate_missing, the period is not judged.",
-    "excluded": "Void/cancelled invoices are not counted. Invalid records are ignored and reported as data_quality.",
-    "remediation": "Existing credit memos and applied sandbox fixes are netted against findings "
-                   "(remaining_delta, status remediated). Credit memos no overbilling explains -> unmatched_credit.",
-    "collection": "Unpaid invoices past their due date -> collection_risk (billed but not collected).",
-    "safety_net": "Per plan, billed_to_date - expected_to_date must equal the sum of finding deltas; any "
-                  "leftover -> unexplained_difference.",
-    "not_handled": ["A late invoice in a period nobody else billed is labelled with that period (amount right, "
-                    "month may be off)", "Pauses, usage-based billing, taxes, price changes without an "
-                    "amending plan", "Orphan invoices are never attributed automatically"],
-}
+
+# ---------------------------------------------------------------- the two building blocks
+
+@dataclass
+class Billed:
+    """One invoice as the plan sees it: its amount converted to the plan currency."""
+    invoice: Invoice
+    amount: float | None  # in plan currency; None = no FX rate, could not be converted
+    fx: dict              # the fx_convert result: rate, rate_date, calculation, note
+    tag: str | None = None  # "late" / "early" if moved to another period, "no_fx" if not converted
 
 
-def _to_plan_ccy(amount: float, ccy: str, plan: Plan, on: date) -> dict:
+@dataclass
+class Slot:
+    """One billing period and everything matched to it."""
+    start: date
+    end: date
+    expected: float
+    partial: bool  # a stub cut short by a newer plan
+    due: bool      # started on or before the as-of date
+    billed: list[Billed] = field(default_factory=list)
+    duplicates: list[Billed] = field(default_factory=list)
+    voids: list[Invoice] = field(default_factory=list)
+    unverified: bool = False  # holds an invoice that could not be converted -> not judged
+
+    def contains(self, d: date) -> bool:
+        return self.start <= d <= self.end
+
+    def label(self) -> dict:
+        return {"start": str(self.start), "end": str(self.end)}
+
+    @property
+    def total(self) -> float:
+        return round(sum(b.amount for b in self.billed), 2)
+
+    @property
+    def judged(self) -> bool:
+        """Counts in the reconciliation: due (and not a stub), or something was billed in it."""
+        return not self.unverified and ((self.due and not self.partial) or bool(self.billed or self.duplicates))
+
+
+def _finding(plan: Plan, **fields) -> Finding:
+    return Finding(plan_id=plan.plan_id, customer_name=plan.customer_name, **fields)
+
+
+def _convert(inv: Invoice, plan: Plan) -> Billed:
     try:
-        return fx_convert(amount, ccy, plan.currency, on)
+        fx = fx_convert(inv.amount_invoiced, inv.currency, plan.currency, inv.issue_date)
+        return Billed(inv, fx["amount"], fx)
     except FxError as e:
-        return {"amount": None, "error": str(e)}
+        return Billed(inv, None, {"amount": None, "error": str(e)}, tag="no_fx")
 
 
-def _period_label(p: dict) -> dict:
-    return {"start": str(p["start"]), "end": str(p["end"])}
-
-
-def _contains(p: dict, d: date) -> bool:
-    return p["start"] <= d <= p["end"]
-
-
-def _assign(inv: Invoice, amount: float, home: dict, periods: list[dict]) -> tuple[dict, str | None]:
-    """Pick the billing period an invoice pays for. Returns (period, tag)."""
-    if not home["invoices"] and not home["partial"]:
-        return home, None
-    if amount > 0:
-        earlier = [p for p in periods if p["due"] and not p["partial"] and not p["invoices"]
-                   and p["start"] < home["start"]]
-        if earlier and amount >= config.REASSIGN_MIN_SHARE * earlier[0]["expected"]:
-            return earlier[0], "late"
-        later = [p for p in periods if p["start"] > home["start"]]
-        nxt = later[0] if later else None
-        if (nxt and not nxt["invoices"] and not nxt["partial"]
-                and 0 < (nxt["start"] - inv.issue_date).days <= config.EARLY_BILLING_DAYS
-                and amount >= config.REASSIGN_MIN_SHARE * nxt["expected"]):
-            return nxt, "early"
-    return home, None
-
-
-# ---------------------------------------------------------------- per plan
+# ---------------------------------------------------------------- entry point
 
 def analyze_plan(plan: Plan, plans: dict[str, Plan], invoices: list[Invoice], as_of: date) -> dict:
     t = term(plan, plans)
-    periods = expected_periods(plan, plans, as_of)
-    for p in periods:
-        p.update(invoices=[], duplicates=[], voids=[], unverified=False)  # invoices: (inv, conv, tag)
-    findings: list[Finding] = []
-    base = dict(plan_id=plan.plan_id, customer_name=plan.customer_name)
-    term_note = (f"Term {t['start']}..{t['end']} ("
-                 + ("end_date of the plan" if plan.end_date else "12 months from start_date")
-                 + (f", cut short because {t['superseded_by']} supersedes it" if t["superseded_by"] else "") + ")")
+    slots = [Slot(**p) for p in expected_periods(plan, plans, as_of)]
+    term_note = _term_note(plan, t)
 
-    # 1. Assign each invoice to a billing period
-    for inv in sorted(invoices, key=lambda i: (i.issue_date, i.invoice_id)):
-        home = next((p for p in periods if _contains(p, inv.issue_date)), None)
-        if inv.status.lower() in VOID_STATUSES:
-            if home:
-                home["voids"].append(inv)
-            continue
-        if home is None:
-            findings.append(Finding(
-                **base, finding_id=f"F-{plan.plan_id}-out_of_term-{inv.invoice_id}", type="out_of_term",
-                invoice_ids=[inv.invoice_id], actual=Money(amount=inv.amount_invoiced, currency=inv.currency),
-                calculation=f"{inv.invoice_id} issued {inv.issue_date}, outside term {t['start']}..{t['end']}",
-                evidence=[inv.invoice_id], assumptions=[term_note], confidence="low", status="needs_review",
-            ))
-            continue
-        conv = _to_plan_ccy(inv.amount_invoiced, inv.currency, plan, inv.issue_date)
-        if conv["amount"] is None:
-            home["unverified"] = True
-            home["invoices"].append((inv, conv, "no_fx"))
-            findings.append(Finding(
-                **base, finding_id=f"F-{plan.plan_id}-fx_rate_missing-{inv.invoice_id}", type="fx_rate_missing",
-                invoice_ids=[inv.invoice_id], period=_period_label(home),
-                actual=Money(amount=inv.amount_invoiced, currency=inv.currency),
-                calculation=f"{inv.invoice_id} billed {inv.amount_invoiced:g} {inv.currency}: {conv['error']}. "
-                            f"Period {home['start']}..{home['end']} cannot be verified",
-                evidence=[inv.invoice_id], confidence="low", status="needs_review",
-                assumptions=["Add the missing exchange rate to verify this period"],
-            ))
-            continue
-        target, tag = _assign(inv, conv["amount"], home, periods)
-        target["invoices"].append((inv, conv, tag))
-
-    # 2. Compare each period's expected amount with what was billed
-    for p in periods:
-        if p["unverified"]:
-            continue
-        label = _period_label(p)
-        key = f"{plan.plan_id}-{{}}-{p['start']}"
-        void_notes = [f"{v.invoice_id} ({v.amount_invoiced:g} {v.currency}, issued {v.issue_date}) is "
-                      f"'{v.status}' and not counted as billed" for v in p["voids"]]
-        if not p["invoices"]:
-            if p["due"] and not p["partial"]:
-                findings.append(Finding(
-                    **base, finding_id="F-" + key.format("missing_period"), type="missing_period",
-                    period=label, expected=Money(amount=p["expected"], currency=plan.currency),
-                    actual=Money(amount=0, currency=plan.currency), delta=-p["expected"],
-                    calculation=f"{plan.total_value:g} {plan.currency} over the term, {plan.cadence.lower()} -> "
-                                f"{p['expected']:g} expected; no invoice for {p['start']}..{p['end']} "
-                                f"-> gap {p['expected']:g}",
-                    evidence=[f"No {plan.plan_id} invoice dated {p['start']}..{p['end']}"] +
-                             [v.invoice_id for v in p["voids"]],
-                    assumptions=[term_note, f"Period counted as due because it started on or before as-of {as_of}"]
-                                + void_notes,
-                ))
-            continue
-
-        # A second invoice for the full period amount is a duplicate, not a split payment
-        full = [x for x in p["invoices"] if abs(x[1]["amount"] - p["expected"]) < EPS]
-        for dup in full[1:]:
-            p["invoices"].remove(dup)
-            p["duplicates"].append(dup)
-            inv, conv, _ = dup
-            findings.append(Finding(
-                **base, finding_id=f"F-{plan.plan_id}-duplicate_invoice-{inv.invoice_id}",
-                type="duplicate_invoice", invoice_ids=[inv.invoice_id, full[0][0].invoice_id],
-                period=label, expected=Money(amount=0, currency=plan.currency),
-                actual=Money(amount=conv["amount"], currency=plan.currency), delta=conv["amount"],
-                calculation=f"Period {p['start']}..{p['end']} already billed in full by {full[0][0].invoice_id}; "
-                            f"{inv.invoice_id} adds {conv['amount']:g} {plan.currency}",
-                evidence=[inv.invoice_id, full[0][0].invoice_id], confidence="medium",
-                assumptions=["One full invoice per billing period"],
-            ))
-
-        items = p["invoices"]
-        total = round(sum(c["amount"] for _, c, _ in items), 2)
-        delta = round(total - p["expected"], 2)
-        if abs(delta) < EPS:
-            continue
-        ccy_differs = any(i.currency != plan.currency for i, _, _ in items)
-        ftype = "currency_mismatch" if ccy_differs else ("underbilled" if delta < 0 else "overbilled")
-        parts = [f"{i.invoice_id} {i.amount_invoiced:g} {i.currency}"
-                 + (f" ({c['calculation']})" if i.currency != plan.currency else "") for i, c, _ in items]
-        calc = (f"Expected {p['expected']:g} {plan.currency}; billed {' + '.join(parts)}"
-                + (f" = {total:g} {plan.currency}" if len(items) > 1 or ccy_differs else "")
-                + f"; delta {delta:+g} {plan.currency}")
-        assumptions, confidence = [term_note], "high"
-        for i, c, tag in items:
-            if i.currency != plan.currency:
-                assumptions.append(f"{i.invoice_id} in {i.currency} but plan in {plan.currency}; converted at "
-                                   f"{c['rate']} ({c['rate_date']})")
-                if c.get("note"):
-                    assumptions.append(c["note"])
-            if tag:
-                confidence = "medium"
-                assumptions.append(f"{i.invoice_id} (issued {i.issue_date}) assumed to be {tag} billing for "
-                                   f"{p['start']}..{p['end']}")
-        if len(items) > 1:
-            assumptions.append(f"Period billed in {len(items)} invoices; amounts summed")
-        refunds = [i for i, _, _ in items if i.amount_invoiced < 0]
-        if refunds:
-            confidence = "low"
-            assumptions.append(f"Includes negative invoice(s) {[i.invoice_id for i in refunds]} "
-                               f"({'; '.join(i.description for i in refunds)}): if it was an agreed refund "
-                               "or SLA credit, there is no leakage. Confirm before recovering it")
-        findings.append(Finding(
-            **base, finding_id="F-" + key.format(ftype), type=ftype, invoice_ids=[i.invoice_id for i, _, _ in items],
-            period=label, expected=Money(amount=p["expected"], currency=plan.currency),
-            actual=Money(amount=total, currency=plan.currency), delta=delta, calculation=calc,
-            evidence=[i.invoice_id for i, _, _ in items], assumptions=assumptions + void_notes,
-            confidence=confidence,
-        ))
-
-    # 3. Partial stub at the end of a superseded term: prorated billing is an alternative reading
-    for p in periods:
-        if p["partial"] and p["due"] and not p["invoices"] and not p["unverified"]:
-            stub = (f"Stub {p['start']}..{p['end']} before {t['superseded_by']} took over: if billed prorated, "
-                    f"{p['expected']:g} {plan.currency} more is due")
-            prior = [f for f in findings if f.delta < 0]
-            if prior:
-                f = prior[-1]
-                f.confidence = "medium" if f.confidence == "high" else f.confidence
-                f.assumptions.append(f"Stub period {p['start']}..{p['end']} treated as not billable (superseded)")
-                f.alternatives.append({
-                    "description": stub, "delta": round(f.delta - p["expected"], 2),
-                    "calculation": f"{f.delta:g} - {p['expected']:g} = {round(f.delta - p['expected'], 2):g}",
-                })
-            else:
-                findings.append(Finding(
-                    **base, finding_id=f"F-{plan.plan_id}-stub-{p['start']}", type="missing_period",
-                    period=_period_label(p), calculation=stub, confidence="low", status="needs_review",
-                    assumptions=[term_note, "Prorated by whole months; billable only if the contract says so"],
-                ))
-
-    findings += _entitlement_gaps(plan, invoices, findings)
+    findings = assign_invoices(plan, t, slots, invoices, term_note)            # step 1
+    for slot in slots:                                                        # step 2
+        findings += judge_period(plan, slot, term_note, as_of)
+    add_stub_alternative(plan, t, slots, findings, term_note)                 # step 3
+    findings += _entitlement_gaps(plan, invoices, findings)                    # step 4
     findings += _plan_inconsistency(plan)
 
-    # 4. Safety net: every dollar due and every dollar billed must be explained by the findings
-    judged = [p for p in periods if not p["unverified"]
-              and ((p["due"] and not p["partial"]) or p["invoices"] or p["duplicates"])]
-    expected_to_date = sum(p["expected"] for p in judged)
-    billed_to_date = sum(c["amount"] for p in judged for _, c, _ in p["invoices"] + p["duplicates"])
+    judged = [s for s in slots if s.judged]                                   # step 5
+    expected_to_date = sum(s.expected for s in judged)
+    billed_to_date = sum(b.amount for s in judged for b in s.billed + s.duplicates)
     reconciliation, leftover = checks.reconcile(plan, expected_to_date, billed_to_date, findings)
     if leftover:
         findings.append(leftover)
@@ -238,35 +105,224 @@ def analyze_plan(plan: Plan, plans: dict[str, Plan], invoices: list[Invoice], as
         "plan": plan.model_dump(mode="json"),
         "term": {k: str(v) if v else None for k, v in t.items()},
         "per_period_amount": per_period_amount(plan),
-        "periods": [_period_row(p, plan) for p in periods],
+        "periods": [_period_row(s, plan) for s in slots],
         "reconciliation": reconciliation,
         "findings": findings,
     }
 
 
-def _period_row(p: dict, plan: Plan) -> dict:
-    counted = p["invoices"] + p["duplicates"]
-    billed = round(sum(c["amount"] or 0 for _, c, _ in counted if c.get("amount") is not None), 2)
-    if p["unverified"]:
-        status = "unverified_missing_fx_rate"
-    elif not counted:
-        status = "not_due_yet" if not p["due"] else ("partial_stub_unbilled" if p["partial"] else "missing")
-    elif abs(billed - p["expected"]) < EPS:
-        status = "ok"
-    else:
-        status = "underbilled" if billed < p["expected"] else "overbilled"
-    return {
-        **_period_label(p), "expected": p["expected"], "currency": plan.currency, "billed_in_plan_ccy": billed,
-        "invoices": [f"{i.invoice_id} ({i.amount_invoiced:g} {i.currency}, {i.issue_date}{', ' + tag if tag else ''})"
-                     for i, _, tag in p["invoices"]]
-                    + [f"{i.invoice_id} (duplicate)" for i, _, _ in p["duplicates"]]
-                    + [f"{v.invoice_id} ({v.status}, not counted)" for v in p["voids"]],
-        "partial": p["partial"], "status": status,
-    }
+def _term_note(plan: Plan, t: dict) -> str:
+    source = "end_date of the plan" if plan.end_date else "12 months from start_date"
+    cut = f", cut short because {t['superseded_by']} supersedes it" if t["superseded_by"] else ""
+    return f"Term {t['start']}..{t['end']} ({source}{cut})"
 
+
+# ---------------------------------------------------------------- step 1: assign
+
+def assign_invoices(plan: Plan, t: dict, slots: list[Slot], invoices: list[Invoice],
+                    term_note: str) -> list[Finding]:
+    """Put each invoice in the period it pays for. Returns the findings that arise while doing so
+    (invoice outside the term, invoice that cannot be converted)."""
+    findings = []
+    for inv in sorted(invoices, key=lambda i: (i.issue_date, i.invoice_id)):
+        home = next((s for s in slots if s.contains(inv.issue_date)), None)
+
+        if inv.status.lower() in VOID_STATUSES:  # cancelled: never counts as billed
+            if home:
+                home.voids.append(inv)
+            continue
+
+        if home is None:  # no period contains the date -> outside the contract
+            findings.append(_finding(
+                plan, finding_id=f"F-{plan.plan_id}-out_of_term-{inv.invoice_id}", type="out_of_term",
+                invoice_ids=[inv.invoice_id], actual=Money(amount=inv.amount_invoiced, currency=inv.currency),
+                calculation=f"{inv.invoice_id} issued {inv.issue_date}, outside term {t['start']}..{t['end']}",
+                evidence=[inv.invoice_id], assumptions=[term_note], confidence="low", status="needs_review",
+            ))
+            continue
+
+        billed = _convert(inv, plan)
+        if billed.amount is None:  # no FX rate: keep it in its period but don't judge that period
+            home.unverified = True
+            home.billed.append(billed)
+            findings.append(_finding(
+                plan, finding_id=f"F-{plan.plan_id}-fx_rate_missing-{inv.invoice_id}", type="fx_rate_missing",
+                invoice_ids=[inv.invoice_id], period=home.label(),
+                actual=Money(amount=inv.amount_invoiced, currency=inv.currency),
+                calculation=f"{inv.invoice_id} billed {inv.amount_invoiced:g} {inv.currency}: {billed.fx['error']}. "
+                            f"Period {home.start}..{home.end} cannot be verified",
+                evidence=[inv.invoice_id], confidence="low", status="needs_review",
+                assumptions=["Add the missing exchange rate to verify this period"],
+            ))
+            continue
+
+        target, billed.tag = choose_slot(billed, home, slots)
+        target.billed.append(billed)
+    return findings
+
+
+def choose_slot(b: Billed, home: Slot, slots: list[Slot]) -> tuple[Slot, str | None]:
+    """Which period does this invoice pay for?
+
+    Rule 1, normal: its own period, if nothing was billed there yet.
+    Rule 2, late:   own period taken AND an earlier due period is still unbilled -> that one.
+                    e.g. C-1007: I-9110 issued 10 Jun pays for Mar-May.
+    Rule 3, early:  own period taken AND issued at most EARLY_BILLING_DAYS before the next,
+                    still free period -> the next one.  e.g. P-EARLY: 26 Nov pays for December.
+    Rule 4, share:  otherwise it shares its own period (split billing, refund or duplicate);
+                    judge_period() decides which.
+    Rules 2 and 3 only move invoices worth >= REASSIGN_MIN_SHARE of the target period, so a split
+    part (400 of 1,000) or a refund (-1,000) stays where it was issued.
+    """
+    if not home.billed and not home.partial:
+        return home, None                                                     # rule 1
+    if b.amount > 0:
+        def big_enough(s: Slot) -> bool:
+            return b.amount >= config.REASSIGN_MIN_SHARE * s.expected
+
+        unbilled_earlier = [s for s in slots if s.due and not s.partial and not s.billed and s.start < home.start]
+        if unbilled_earlier and big_enough(unbilled_earlier[0]):
+            return unbilled_earlier[0], "late"                                # rule 2
+
+        nxt = next((s for s in slots if s.start > home.start), None)
+        days_before = (nxt.start - b.invoice.issue_date).days if nxt else None
+        if (nxt and not nxt.billed and not nxt.partial and big_enough(nxt)
+                and 0 < days_before <= config.EARLY_BILLING_DAYS):
+            return nxt, "early"                                               # rule 3
+    return home, None                                                         # rule 4
+
+
+# ---------------------------------------------------------------- step 2: judge
+
+def judge_period(plan: Plan, slot: Slot, term_note: str, as_of: date) -> list[Finding]:
+    """Compare what one period should have billed with what it did bill."""
+    if slot.unverified:
+        return []  # already reported as fx_rate_missing
+    void_notes = [f"{v.invoice_id} ({v.amount_invoiced:g} {v.currency}, issued {v.issue_date}) is "
+                  f"'{v.status}' and not counted as billed" for v in slot.voids]
+
+    if not slot.billed:
+        if slot.due and not slot.partial:
+            return [_missing_period(plan, slot, term_note, as_of, void_notes)]
+        return []
+
+    findings = _split_off_duplicates(plan, slot)
+    delta = round(slot.total - slot.expected, 2)
+    if abs(delta) >= EPS:
+        findings.append(_amount_mismatch(plan, slot, delta, term_note, void_notes))
+    return findings
+
+
+def _missing_period(plan: Plan, slot: Slot, term_note: str, as_of: date, void_notes: list[str]) -> Finding:
+    return _finding(
+        plan, finding_id=f"F-{plan.plan_id}-missing_period-{slot.start}", type="missing_period",
+        period=slot.label(), expected=Money(amount=slot.expected, currency=plan.currency),
+        actual=Money(amount=0, currency=plan.currency), delta=-slot.expected,
+        calculation=f"{plan.total_value:g} {plan.currency} over the term, {plan.cadence.lower()} -> "
+                    f"{slot.expected:g} expected; no invoice for {slot.start}..{slot.end} -> gap {slot.expected:g}",
+        evidence=[f"No {plan.plan_id} invoice dated {slot.start}..{slot.end}"] + [v.invoice_id for v in slot.voids],
+        assumptions=[term_note, f"Period counted as due because it started on or before as-of {as_of}"] + void_notes,
+    )
+
+
+def _split_off_duplicates(plan: Plan, slot: Slot) -> list[Finding]:
+    """A second invoice for the FULL period amount is a duplicate, not a split payment.
+    It is moved out of slot.billed so it doesn't count twice in the comparison."""
+    full = [b for b in slot.billed if abs(b.amount - slot.expected) < EPS]
+    findings = []
+    for dup in full[1:]:
+        slot.billed.remove(dup)
+        slot.duplicates.append(dup)
+        first = full[0].invoice
+        findings.append(_finding(
+            plan, finding_id=f"F-{plan.plan_id}-duplicate_invoice-{dup.invoice.invoice_id}",
+            type="duplicate_invoice", invoice_ids=[dup.invoice.invoice_id, first.invoice_id],
+            period=slot.label(), expected=Money(amount=0, currency=plan.currency),
+            actual=Money(amount=dup.amount, currency=plan.currency), delta=dup.amount,
+            calculation=f"Period {slot.start}..{slot.end} already billed in full by {first.invoice_id}; "
+                        f"{dup.invoice.invoice_id} adds {dup.amount:g} {plan.currency}",
+            evidence=[dup.invoice.invoice_id, first.invoice_id], confidence="medium",
+            assumptions=["One full invoice per billing period"],
+        ))
+    return findings
+
+
+def _amount_mismatch(plan: Plan, slot: Slot, delta: float, term_note: str, void_notes: list[str]) -> Finding:
+    """The period was billed, but the (summed, converted) amount differs from the plan."""
+    items = slot.billed
+    foreign = any(b.invoice.currency != plan.currency for b in items)
+    ftype = "currency_mismatch" if foreign else ("underbilled" if delta < 0 else "overbilled")
+
+    # the calculation, e.g. "Expected 25000 USD; billed I-9123 25000 EUR (25000 EUR x 1.08 = 27000 USD) ..."
+    parts = [f"{b.invoice.invoice_id} {b.invoice.amount_invoiced:g} {b.invoice.currency}"
+             + (f" ({b.fx['calculation']})" if b.invoice.currency != plan.currency else "") for b in items]
+    calc = (f"Expected {slot.expected:g} {plan.currency}; billed {' + '.join(parts)}"
+            + (f" = {slot.total:g} {plan.currency}" if len(items) > 1 or foreign else "")
+            + f"; delta {delta:+g} {plan.currency}")
+
+    # every guess we made, and how sure we are
+    assumptions, confidence = [term_note], "high"
+    for b in items:
+        if b.invoice.currency != plan.currency:
+            assumptions.append(f"{b.invoice.invoice_id} in {b.invoice.currency} but plan in {plan.currency}; "
+                               f"converted at {b.fx['rate']} ({b.fx['rate_date']})")
+            if b.fx.get("note"):
+                assumptions.append(b.fx["note"])
+        if b.tag:  # moved by choose_slot
+            confidence = "medium"
+            assumptions.append(f"{b.invoice.invoice_id} (issued {b.invoice.issue_date}) assumed to be {b.tag} "
+                               f"billing for {slot.start}..{slot.end}")
+    if len(items) > 1:
+        assumptions.append(f"Period billed in {len(items)} invoices; amounts summed")
+    refunds = [b.invoice for b in items if b.invoice.amount_invoiced < 0]
+    if refunds:
+        confidence = "low"
+        assumptions.append(f"Includes negative invoice(s) {[i.invoice_id for i in refunds]} "
+                           f"({'; '.join(i.description for i in refunds)}): if it was an agreed refund "
+                           "or SLA credit, there is no leakage. Confirm before recovering it")
+
+    ids = [b.invoice.invoice_id for b in items]
+    return _finding(
+        plan, finding_id=f"F-{plan.plan_id}-{ftype}-{slot.start}", type=ftype, invoice_ids=ids,
+        period=slot.label(), expected=Money(amount=slot.expected, currency=plan.currency),
+        actual=Money(amount=slot.total, currency=plan.currency), delta=delta, calculation=calc,
+        evidence=ids, assumptions=assumptions + void_notes, confidence=confidence,
+    )
+
+
+# ---------------------------------------------------------------- step 3: stub
+
+def add_stub_alternative(plan: Plan, t: dict, slots: list[Slot], findings: list[Finding], term_note: str) -> None:
+    """When a newer plan cuts this one short, the leftover stub (C-1007: June) may or may not be
+    billable. Primary reading: not billable. The other reading is attached as an alternative."""
+    for slot in slots:
+        if not (slot.partial and slot.due and not slot.billed and not slot.unverified):
+            continue
+        stub = (f"Stub {slot.start}..{slot.end} before {t['superseded_by']} took over: if billed prorated, "
+                f"{slot.expected:g} {plan.currency} more is due")
+        gaps = [f for f in findings if f.delta < 0]
+        if gaps:  # attach to the last gap of this plan
+            f = gaps[-1]
+            f.confidence = "medium" if f.confidence == "high" else f.confidence
+            f.assumptions.append(f"Stub period {slot.start}..{slot.end} treated as not billable (superseded)")
+            f.alternatives.append({
+                "description": stub, "delta": round(f.delta - slot.expected, 2),
+                "calculation": f"{f.delta:g} - {slot.expected:g} = {round(f.delta - slot.expected, 2):g}",
+            })
+        else:
+            findings.append(_finding(
+                plan, finding_id=f"F-{plan.plan_id}-stub-{slot.start}", type="missing_period",
+                period=slot.label(), calculation=stub, confidence="low", status="needs_review",
+                assumptions=[term_note, "Prorated by whole months; billable only if the contract says so"],
+            ))
+
+
+# ---------------------------------------------------------------- step 4: hints from free text
 
 def _entitlement_gaps(plan: Plan, invoices: list[Invoice], findings: list[Finding]) -> list[Finding]:
-    """Triggered only when the plan notes ask to watch entitlement coverage."""
+    """Only when the plan notes ask to watch entitlement coverage (C-1010).
+    An invoice that doesn't mention an entitlement may mean the customer bought less, so the
+    underbilling on that invoice gets a second option: amend the plan instead of invoicing."""
     if "entitlement" not in plan.notes.lower():
         return []
     out = []
@@ -274,16 +330,14 @@ def _entitlement_gaps(plan: Plan, invoices: list[Invoice], findings: list[Findin
         missing = [e for e in plan.entitlements if e.lower() not in inv.description.lower()]
         if not missing:
             continue
-        out.append(Finding(
-            plan_id=plan.plan_id, customer_name=plan.customer_name,
-            finding_id=f"F-{plan.plan_id}-entitlement_gap-{inv.invoice_id}", type="entitlement_gap",
+        out.append(_finding(
+            plan, finding_id=f"F-{plan.plan_id}-entitlement_gap-{inv.invoice_id}", type="entitlement_gap",
             invoice_ids=[inv.invoice_id],
             calculation=f"Plan entitlements {plan.entitlements}; {inv.invoice_id} description "
                         f"'{inv.description}' does not mention {missing}",
             evidence=[inv.invoice_id, f"Plan notes: '{plan.notes}'"], confidence="low", status="needs_review",
             assumptions=["Inferred from free-text description; intent must be confirmed by a human"],
         ))
-        # The same invoice is likely underbilled: either recover the money or fix the contract.
         # If the notes name a specific entitlement, that is the one most likely dropped.
         named = [e for e in missing if e.lower() in plan.notes.lower()] or missing
         for f in findings:
@@ -305,8 +359,7 @@ def _entitlement_gaps(plan: Plan, invoices: list[Invoice], findings: list[Findin
 
 
 def _plan_inconsistency(plan: Plan) -> list[Finding]:
-    """Amounts written in the notes (a number next to a currency, e.g. '~8000 USD') that
-    contradict total_value / cadence."""
+    """An amount written in the notes next to a currency ('~8000 USD') that contradicts the fields."""
     text = plan.notes.replace(",", "")
     amount = r"(\d+(?:\.\d+)?)"
     ccy = r"(?:USD|EUR|GBP|\$|€|£)"
@@ -315,9 +368,8 @@ def _plan_inconsistency(plan: Plan) -> list[Finding]:
     bad = [n for n in numbers if abs(n - expected) > EPS and abs(n - plan.total_value) > EPS]
     if not bad:
         return []
-    return [Finding(
-        plan_id=plan.plan_id, customer_name=plan.customer_name,
-        finding_id=f"F-{plan.plan_id}-plan_inconsistency", type="plan_inconsistency",
+    return [_finding(
+        plan, finding_id=f"F-{plan.plan_id}-plan_inconsistency", type="plan_inconsistency",
         calculation=f"Notes mention {bad}; plan says {plan.total_value:g} {plan.cadence.lower()} = "
                     f"{expected:g} per period",
         evidence=[f"Plan notes: '{plan.notes}'"], confidence="low", status="needs_review",
@@ -325,114 +377,25 @@ def _plan_inconsistency(plan: Plan) -> list[Finding]:
     )]
 
 
-# ---------------------------------------------------------------- remediation
+# ---------------------------------------------------------------- output table
 
-def _apply_remediation(f: Finding, plan: Plan, memos: list[CreditMemo], make_goods: list[Invoice]) -> set[str]:
-    """Net existing fixes (data credit memos like M-300, or sandbox actions) against the finding.
-    Returns the ids of the memos used, so unexplained credits can be detected."""
-    covered, ids = 0.0, []
-    if f.delta > 0:
-        sources = [(m.memo_id, m.amount, m.currency, m.issue_date) for m in memos
-                   if m.finding_id == f.finding_id or (m.finding_id is None and m.invoice_id in f.invoice_ids)]
-    elif f.delta < 0:
-        sources = [(i.invoice_id, i.amount_invoiced, i.currency, i.issue_date) for i in make_goods
-                   if i.finding_id == f.finding_id]
+def _period_row(slot: Slot, plan: Plan) -> dict:
+    """One line of the period-by-period table the agent shows ("what about the other months?")."""
+    counted = slot.billed + slot.duplicates
+    billed = round(sum(b.amount for b in counted if b.amount is not None), 2)
+    if slot.unverified:
+        status = "unverified_missing_fx_rate"
+    elif not counted:
+        status = "not_due_yet" if not slot.due else ("partial_stub_unbilled" if slot.partial else "missing")
+    elif abs(billed - slot.expected) < EPS:
+        status = "ok"
     else:
-        sources = []
-    for rid, amount, ccy, on in sources:
-        try:
-            covered += fx_convert(amount, ccy, plan.currency, on)["amount"]
-            ids.append(rid)
-        except FxError as e:
-            f.assumptions.append(f"{rid} could not be netted: {e}")
-    f.existing_remediation = ids
-    sign = 1 if f.delta > 0 else -1
-    f.remaining_delta = round(sign * max(abs(f.delta) - covered, 0), 2) + 0.0  # + 0.0 avoids -0.0
-    if ids:
-        f.status = "remediated" if abs(f.remaining_delta) < EPS else "partially_remediated"
-        f.calculation += f"; already covered {covered:g} by {ids} -> remaining {f.remaining_delta:+g}"
-    return set(ids) if f.delta > 0 else set()
-
-
-def _suggest(f: Finding, plan: Plan) -> None:
-    if f.status in ("remediated", "needs_review") or abs(f.remaining_delta) < EPS:
-        return
-    period = f" for {f.period['start']}..{f.period['end']}" if f.period else ""
-    reason = f"{f.type.replace('_', ' ').capitalize()}{period}"
-    if f.remaining_delta < 0:
-        f.suggested_action = {"tool": "propose_make_good_invoice", "args": {
-            "plan_id": plan.plan_id, "amount": abs(f.remaining_delta), "reason": reason, "finding_id": f.finding_id}}
-    elif f.invoice_ids:
-        f.suggested_action = {"tool": "propose_credit_memo", "args": {
-            "invoice_id": f.invoice_ids[0], "amount": f.remaining_delta, "reason": reason,
-            "finding_id": f.finding_id}}
-
-
-# ---------------------------------------------------------------- entry point
-
-def investigate(plan_id: str = "all", as_of: date | None = None) -> dict:
-    as_of = as_of or config.get_as_of()
-    plans = repository.get_plans()
-    if plan_id != "all" and plan_id not in plans:
-        raise KeyError(f"Unknown plan_id '{plan_id}'. Known: {sorted(plans)}")
-    invoices = repository.get_invoices()
-    memos = repository.get_credit_memos()
-
-    regular = [i for i in invoices if i.kind == "regular"]
-    make_goods = [i for i in invoices if i.kind == "make_good"]
-    orphans = [i for i in regular if not i.plan_id or i.plan_id not in plans]
-    by_plan: dict[str, list[Invoice]] = defaultdict(list)
-    for inv in regular:
-        if inv not in orphans:
-            by_plan[effective_plan_id(inv.plan_id, inv.issue_date, plans)].append(inv)
-
-    reports = {pid: analyze_plan(p, plans, by_plan[pid], as_of) for pid, p in plans.items()}
-    used_memos: set[str] = set()
-    for pid, r in reports.items():
-        for f in r["findings"]:
-            used_memos |= _apply_remediation(f, plans[pid], memos, make_goods)
-            _suggest(f, plans[pid])
-        r["findings"] += checks.collection_risk(plans[pid], by_plan[pid], as_of)
-
-    by_id = {i.invoice_id: i for i in invoices}
-    other: list[Finding] = []
-    for f in checks.unmatched_credits(memos, used_memos, plans, by_id):
-        (reports[f.plan_id]["findings"] if f.plan_id in reports else other).append(f)
-    orphan_findings = checks.detect_orphans(orphans, plans)
-    checks.link_orphans(orphan_findings, [f for r in reports.values() for f in r["findings"]], by_id)
-    other += orphan_findings + checks.data_quality(repository.load_issues())
-
-    selected = list(reports.values())
-    if plan_id != "all":
-        selected = [reports[plan_id]]
-        other = [o for o in orphan_findings
-                 if any(c["plan_id"] == plan_id for c in o.alternatives[0]["candidate_plans"])]
-
-    all_findings = [f for r in selected for f in r["findings"]] + other
-    open_ = [f for f in all_findings if f.status in ("open", "partially_remediated")]
-    by_type: dict[str, int] = defaultdict(int)
-    for f in all_findings:
-        by_type[f.type] += 1
+        status = "underbilled" if billed < slot.expected else "overbilled"
     return {
-        "as_of": str(as_of),
-        "method": METHOD,
-        "plans": [{**r, "findings": [f.model_dump(mode="json") for f in r["findings"]]} for r in selected],
-        "other_findings": [o.model_dump(mode="json") for o in other],
-        "summary": {
-            "open_findings": len(open_),
-            "needs_review": len([f for f in all_findings if f.status == "needs_review"]),
-            "remediated": len([f for f in all_findings if f.status == "remediated"]),
-            "by_type": dict(by_type),
-            "net_underbilled": round(sum(-f.remaining_delta for f in open_ if f.remaining_delta < 0), 2),
-            "net_overbilled": round(sum(f.remaining_delta for f in open_ if f.remaining_delta > 0), 2),
-            "plans_not_reconciled": [r["plan"]["plan_id"] for r in selected if not r["reconciliation"]["ok"]],
-        },
+        **slot.label(), "expected": slot.expected, "currency": plan.currency, "billed_in_plan_ccy": billed,
+        "invoices": [f"{b.invoice.invoice_id} ({b.invoice.amount_invoiced:g} {b.invoice.currency}, "
+                     f"{b.invoice.issue_date}{', ' + b.tag if b.tag else ''})" for b in slot.billed]
+                    + [f"{b.invoice.invoice_id} (duplicate)" for b in slot.duplicates]
+                    + [f"{v.invoice_id} ({v.status}, not counted)" for v in slot.voids],
+        "partial": slot.partial, "status": status,
     }
-
-
-def find_finding(finding_id: str, as_of: date | None = None) -> Finding | None:
-    result = investigate("all", as_of)
-    for f in [f for r in result["plans"] for f in r["findings"]] + result["other_findings"]:
-        if f["finding_id"] == finding_id:
-            return Finding(**f)
-    return None

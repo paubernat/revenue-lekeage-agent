@@ -3,10 +3,11 @@
 from datetime import date
 from typing import Any, Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 Cadence = Literal["Monthly", "Quarterly", "Annual"]
 PERIODS_PER_YEAR = {"Monthly": 12, "Quarterly": 4, "Annual": 1}
+EPS = 0.01  # money tolerance: amounts closer than one cent are equal
 
 
 class Plan(BaseModel):

@@ -1,7 +1,7 @@
 """The dataset's known anomalies, with exact amounts (as-of 2025-12-31)."""
 from datetime import date
 
-from core.detectors import investigate
+from core.investigation import investigate
 from core.fx import fx_convert
 
 

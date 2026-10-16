@@ -27,9 +27,11 @@ core/             pure business logic, no LLM and no UI, fully unit-tested
                   invalid records are skipped and reported, never fatal
   fx.py           conversion with the rate for the date or the closest earlier one
   schedule.py     plan term + expected billing periods (end_date, rounding)
-  detectors.py    per plan: expected vs. actual -> Findings (deterministic ids, calculation, evidence)
+  investigation.py the whole pipeline, top to bottom: load → route → detect → remediate → check → report
+  detectors.py    per plan: assign invoices to periods, judge each period, stub, hints, reconcile
+  remediation.py  nets existing fixes against findings (remaining_delta, status) + suggested action
   checks.py       cross-plan: orphans, collection risk, unexplained credits, data quality, safety net
-  actions.py      drafts with validation, apply, reject, rollback, audit log
+  actions.py      fix lifecycle: guard rails → proposal → apply / reject → rollback, audit log
 data_edge_cases/  demo dataset with one small plan per edge case (sidebar → Dataset)
 tools/            @tool wrappers over core/, the contract the LLM sees
 agent/            system prompt, LLM factory, LangGraph graph

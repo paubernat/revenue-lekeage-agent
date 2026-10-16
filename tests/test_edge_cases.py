@@ -7,7 +7,7 @@ import pytest
 import config
 from core import actions, checks, repository
 from core.actions import ActionError
-from core.detectors import find_finding, investigate
+from core.investigation import find_finding, investigate
 from core.models import Finding, Plan
 from core.schedule import contracted_schedule
 
