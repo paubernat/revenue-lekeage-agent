@@ -121,6 +121,9 @@ Finding types:
 
 ## Demo script
 
+For the full guided walkthrough (simple cases, then actions, guard rails, judgement calls and edge cases),
+see [DEMO.md](DEMO.md). The short version:
+
 1. "Check plan C-1001": Sep/Nov/Dec missing, with the calculation.
 2. "What currency is that plan in?": USD, answered from memory.
 3. "Create a make-good for September": proposal P-001 is shown; `sandbox/invoices.json` is still empty.
